@@ -601,6 +601,16 @@ impl PipeWrite {
         loop {
             let pinned = Pin::new(&self.0);
             let mut ready = ready!(pinned.poll_write_ready(cx))?;
+            #[cfg(target_os = "linux")]
+            let ret = unsafe {
+                libc::vmsplice(
+                    fd,
+                    bufs.as_ptr() as *const libc::iovec,
+                    bufs.len(),
+                    libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
             let ret =
                 unsafe { libc::writev(fd, bufs.as_ptr() as *const libc::iovec, bufs.len() as i32) };
             match cvt!(ret) {
