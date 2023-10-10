@@ -381,6 +381,122 @@ async fn splice_impl(
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn splice_into_blocking_fd_impl(
+    fd_in: &mut AsyncFd<PipeFd>,
+    fd_out: RawFd,
+    mut off_out: Option<&mut off64_t>,
+    len: usize,
+    has_more_data: bool,
+) -> io::Result<usize> {
+    // There is only one reader and one writer, so it only needs to polled once.
+    let mut read_ready = fd_in.readable().await?;
+
+    // Prepare args for the syscall
+    let flags = libc::SPLICE_F_NONBLOCK
+        | if has_more_data {
+            libc::SPLICE_F_MORE
+        } else {
+            0
+        };
+
+    loop {
+        let ret = unsafe {
+            libc::splice(
+                fd_in.as_raw_fd(),
+                ptr::null_mut(),
+                fd_out,
+                as_ptr(off_out.as_deref_mut()),
+                len,
+                flags,
+            )
+        };
+        match cvt!(ret) {
+            Err(e) if is_wouldblock(&e) => {
+                // Since tokio might use epoll's edge-triggered mode, we cannot blindly
+                // clear the readiness, otherwise it would block forever.
+                //
+                // So what we do instead is to use test_read_write_readiness, which
+                // uses poll to test for readiness.
+                //
+                // Poll always uses level-triggered mode and it does not require
+                // any registration at all.
+                let (read_readiness, write_readiness) =
+                    unsafe { test_read_write_readiness(fd_in.as_raw_fd(), fd_out)? };
+
+                if !read_readiness {
+                    read_ready.clear_ready();
+                    read_ready = fd_in.readable().await?;
+                }
+
+                /* We assume the write end is blocking (like a regular file), so this should always
+                 * return true. */
+                assert!(write_readiness);
+            }
+            Err(e) => break Err(e),
+            Ok(ret) => break Ok(ret as usize),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_from_blocking_fd_impl(
+    fd_in: RawFd,
+    mut off_in: Option<&mut off64_t>,
+    fd_out: &AsyncFd<PipeFd>,
+    len: usize,
+    has_more_data: bool,
+) -> io::Result<usize> {
+    // There is only one reader and one writer, so it only needs to polled once.
+    let mut write_ready = fd_out.writable().await?;
+
+    // Prepare args for the syscall
+    let flags = libc::SPLICE_F_NONBLOCK
+        | if has_more_data {
+            libc::SPLICE_F_MORE
+        } else {
+            0
+        };
+
+    loop {
+        let ret = unsafe {
+            libc::splice(
+                fd_in,
+                as_ptr(off_in.as_deref_mut()),
+                fd_out.as_raw_fd(),
+                ptr::null_mut(),
+                len,
+                flags,
+            )
+        };
+        match cvt!(ret) {
+            Err(e) if is_wouldblock(&e) => {
+                // Since tokio might use epoll's edge-triggered mode, we cannot blindly
+                // clear the readiness, otherwise it would block forever.
+                //
+                // So what we do instead is to use test_read_write_readiness, which
+                // uses poll to test for readiness.
+                //
+                // Poll always uses level-triggered mode and it does not require
+                // any registration at all.
+                let (read_readiness, write_readiness) =
+                    unsafe { test_read_write_readiness(fd_in, fd_out.as_raw_fd())? };
+
+                /* We assume the read end is blocking (like a regular file), so this should always
+                 * return true. */
+                assert!(read_readiness);
+
+                if !write_readiness {
+                    write_ready.clear_ready();
+                    write_ready = fd_out.writable().await?;
+                }
+            }
+            Err(e) => break Err(e),
+            Ok(ret) => break Ok(ret as usize),
+        }
+    }
+}
+
 /// Moves data between pipes without copying between kernel address space and
 /// user address space.
 ///
@@ -439,6 +555,17 @@ impl PipeRead {
         has_more_data: bool,
     ) -> io::Result<usize> {
         splice_impl(&mut self.0, None, asyncfd_out, off_out, len, has_more_data).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn splice_to_blocking_fd(
+        &mut self,
+        fd_out: RawFd,
+        off_out: Option<&mut off64_t>,
+        len: usize,
+        has_more_data: bool,
+    ) -> io::Result<usize> {
+        splice_into_blocking_fd_impl(&mut self.0, fd_out, off_out, len, has_more_data).await
     }
 }
 
@@ -648,6 +775,16 @@ impl PipeWrite {
         len: usize,
     ) -> io::Result<usize> {
         splice_impl(asyncfd_in, off_in, &self.0, None, len, false).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn splice_from_blocking_fd(
+        &mut self,
+        fd_in: RawFd,
+        off_in: Option<&mut off64_t>,
+        len: usize,
+    ) -> io::Result<usize> {
+        splice_from_blocking_fd_impl(fd_in, off_in, &self.0, len, false).await
     }
 }
 
@@ -1101,5 +1238,40 @@ with os.fdopen(3, 'wb') as w:
         for i in PIPE_BUF + 1..bytes.len() {
             assert!(AtomicWriteIoSlices::new(&io_slices[..i]).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_splice_blocking() {
+        use tokio::{fs, io::AsyncSeekExt};
+
+        let mut f = fs::File::from_std(tempfile::tempfile().unwrap());
+        let fd = f.as_raw_fd();
+        let mut f2 = fs::File::from_std(tempfile::tempfile().unwrap());
+        let fd2 = f2.as_raw_fd();
+
+        let (mut r, mut w) = pipe().unwrap();
+
+        f.write_all(b"hello").await.unwrap();
+
+        let w_task = tokio::spawn(async move {
+            let mut off: off64_t = 0;
+            w.splice_from_blocking_fd(fd, Some(&mut off), 5)
+                .await
+                .unwrap();
+            assert_eq!(off, 5);
+        });
+
+        let r_task = tokio::spawn(async move {
+            r.splice_to_blocking_fd(fd2, None, 5, false).await.unwrap();
+        });
+
+        tokio::try_join!(w_task, r_task).unwrap();
+
+        assert_eq!(5, f2.stream_position().await.unwrap());
+        f2.rewind().await.unwrap();
+
+        let mut s = String::new();
+        f2.read_to_string(&mut s).await.unwrap();
+        assert_eq!(&s, "hello");
     }
 }
